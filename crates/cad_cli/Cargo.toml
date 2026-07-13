@@ -1,0 +1,17 @@
+[package]
+name = "cad_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cad_cli"
+path = "src/main.rs"
+
+[dependencies]
+cad_core = { path = "../cad_core" }
+cad_io = { path = "../cad_io" }
+cad_batch = { path = "../cad_batch" }
+
+[lints]
+workspace = true

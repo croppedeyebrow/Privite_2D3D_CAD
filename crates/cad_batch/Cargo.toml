@@ -1,0 +1,13 @@
+[package]
+name = "cad_batch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad_core = { path = "../cad_core" }
+cad_command = { path = "../cad_command" }
+cad_io = { path = "../cad_io" }
+
+[lints]
+workspace = true

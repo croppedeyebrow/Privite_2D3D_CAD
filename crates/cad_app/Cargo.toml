@@ -1,0 +1,13 @@
+[package]
+name = "cad_app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad_command = { path = "../cad_command" }
+cad_render = { path = "../cad_render" }
+
+[lints]
+workspace = true
+

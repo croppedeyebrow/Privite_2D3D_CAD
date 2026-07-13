@@ -1,0 +1,12 @@
+[package]
+name = "cad_command"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad_core = { path = "../cad_core" }
+cad_geometry = { path = "../cad_geometry" }
+
+[lints]
+workspace = true

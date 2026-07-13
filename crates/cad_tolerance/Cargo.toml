@@ -1,0 +1,12 @@
+[package]
+name = "cad_tolerance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad_core = { path = "../cad_core" }
+
+[lints]
+workspace = true
+
