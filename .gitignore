@@ -3,4 +3,5 @@
 *.cadproj
 *.autosave.cadproj
 /backups/
+/.claude/
 
