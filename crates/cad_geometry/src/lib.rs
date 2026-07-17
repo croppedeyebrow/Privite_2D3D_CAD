@@ -17,7 +17,7 @@ pub fn approx_eq(a: f64, b: f64, epsilon: f64) -> bool {
 }
 
 #[must_use]
-pub fn line_is_degenerate(line: Line) -> bool {
+pub fn line_is_degenerate(line: &Line) -> bool {
     approx_eq(distance(line.start, line.end).0, 0.0, DEFAULT_EPSILON_MM)
 }
 
@@ -39,7 +39,7 @@ mod tests {
 
     #[test]
     fn detects_zero_length_line() {
-        assert!(line_is_degenerate(Line {
+        assert!(line_is_degenerate(&Line {
             start: point(1.0, 1.0),
             end: point(1.0, 1.0)
         }));

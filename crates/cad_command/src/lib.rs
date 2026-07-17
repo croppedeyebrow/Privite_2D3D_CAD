@@ -113,12 +113,13 @@ fn inverse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cad_core::{EntityGeometry, LengthMm, Line, Point2};
+    use cad_core::{EntityGeometry, LengthMm, Line, Point2, DEFAULT_LAYER_ID};
 
     #[test]
     fn add_entity_can_be_undone_and_redone() {
         let entity = Entity {
             id: EntityId::new(1),
+            layer_id: DEFAULT_LAYER_ID,
             geometry: EntityGeometry::Line(Line {
                 start: Point2 {
                     x: LengthMm(0.0),
