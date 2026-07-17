@@ -356,6 +356,20 @@ impl Drawing {
         self.layers.iter().find(|l| l.id == id)
     }
 
+    /// Removes and returns a layer by stable ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MissingLayer` when no layer has the requested ID.
+    pub fn remove_layer(&mut self, id: LayerId) -> Result<Layer, CoreError> {
+        let index = self
+            .layers
+            .iter()
+            .position(|l| l.id == id)
+            .ok_or(CoreError::MissingLayer(id))?;
+        Ok(self.layers.remove(index))
+    }
+
     /// Adds a dimension while preserving stable-ID uniqueness.
     ///
     /// # Errors
@@ -472,6 +486,26 @@ mod tests {
         let mut drawing = Drawing::default();
         let result = drawing.add_layer(Layer::new(DEFAULT_LAYER_ID, "duplicate"));
         assert_eq!(result, Err(CoreError::DuplicateLayerId(DEFAULT_LAYER_ID)));
+    }
+
+    #[test]
+    fn remove_layer_returns_the_layer() {
+        let mut drawing = Drawing::default();
+        let extra = LayerId::new(1);
+        drawing.add_layer(Layer::new(extra, "dimensions")).unwrap();
+        let removed = drawing.remove_layer(extra).unwrap();
+        assert_eq!(removed.id, extra);
+        assert!(drawing.layer(extra).is_none());
+    }
+
+    #[test]
+    fn remove_layer_reports_missing_layer() {
+        let mut drawing = Drawing::default();
+        let missing = LayerId::new(99);
+        assert_eq!(
+            drawing.remove_layer(missing),
+            Err(CoreError::MissingLayer(missing))
+        );
     }
 
     #[test]
