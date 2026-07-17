@@ -2,13 +2,15 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 // ---------------------------------------------------------------------------
 // Stable identifiers
 // ---------------------------------------------------------------------------
 
 macro_rules! stable_id {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
         pub struct $name(u64);
 
         impl $name {
@@ -43,18 +45,18 @@ stable_id!(SheetId);
 // ---------------------------------------------------------------------------
 
 /// Internal length unit. All calculations use millimetres.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LengthMm(pub f64);
 
 /// Angle in radians.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AngleRad(pub f64);
 
 // ---------------------------------------------------------------------------
 // Geometry primitives
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Point2 {
     pub x: LengthMm,
     pub y: LengthMm,
@@ -70,21 +72,21 @@ impl Point2 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Line {
     pub start: Point2,
     pub end: Point2,
 }
 
 /// Open or closed sequence of connected line segments.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Polyline {
     pub points: Vec<Point2>,
     pub closed: bool,
 }
 
 /// Axis-aligned rectangle defined by origin corner, width, and height.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rectangle {
     /// Lower-left corner in drawing space.
     pub origin: Point2,
@@ -92,14 +94,14 @@ pub struct Rectangle {
     pub height: LengthMm,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Circle {
     pub center: Point2,
     pub radius: LengthMm,
 }
 
 /// Arc defined by centre, radius, and counter-clockwise angle range.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Arc {
     pub center: Point2,
     pub radius: LengthMm,
@@ -109,7 +111,7 @@ pub struct Arc {
     pub sweep_angle: AngleRad,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Text {
     pub origin: Point2,
     pub content: String,
@@ -121,7 +123,8 @@ pub struct Text {
 // Entity
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum EntityGeometry {
     Line(Line),
     Polyline(Polyline),
@@ -131,7 +134,7 @@ pub enum EntityGeometry {
     Text(Text),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entity {
     pub id: EntityId,
     pub layer_id: LayerId,
@@ -142,7 +145,7 @@ pub struct Entity {
 // Layer
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layer {
     pub id: LayerId,
     pub name: String,
@@ -169,7 +172,8 @@ pub const DEFAULT_LAYER_ID: LayerId = LayerId::new(0);
 // Dimension
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DimensionKind {
     /// Horizontal or vertical linear dimension.
     Linear,
@@ -177,7 +181,7 @@ pub enum DimensionKind {
     Aligned,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Dimension {
     pub id: DimensionId,
     pub kind: DimensionKind,
@@ -198,7 +202,7 @@ pub const DEFAULT_DRAWING_ID: DrawingId = DrawingId::new(0);
 /// The first project created by the application.
 pub const DEFAULT_PROJECT_ID: ProjectId = ProjectId::new(0);
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Drawing {
     pub id: DrawingId,
     pub entities: Vec<Entity>,
@@ -217,7 +221,7 @@ impl Default for Drawing {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
     pub drawing: Drawing,
@@ -645,5 +649,27 @@ mod tests {
             report.issues[0].target,
             ValidationTarget::Dimension(DimensionId::new(1))
         );
+    }
+
+    #[test]
+    fn entity_geometry_serializes_with_a_type_tag() {
+        let line = EntityGeometry::Line(Line {
+            start: Point2::new(0.0, 0.0),
+            end: Point2::new(10.0, 0.0),
+        });
+        let json = serde_json::to_value(&line).unwrap();
+        assert_eq!(json["type"], "line");
+        assert_eq!(json["start"]["x"], 0.0);
+        assert_eq!(json["end"]["x"], 10.0);
+    }
+
+    #[test]
+    fn project_round_trips_through_json() {
+        let mut project = Project::default();
+        project.drawing.add_entity(make_line_entity(1)).unwrap();
+
+        let json = serde_json::to_string(&project).unwrap();
+        let restored: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(project, restored);
     }
 }

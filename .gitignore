@@ -1,6 +1,7 @@
 /target/
 *.rs.bk
 *.cadproj
+*.cadproj.tmp
 *.autosave.cadproj
 /backups/
 /.claude/
