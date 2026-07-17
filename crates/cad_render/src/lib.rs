@@ -43,11 +43,21 @@ pub enum RenderPrimitive {
     },
 }
 
-fn is_layer_visible(drawing: &Drawing, layer_id: LayerId) -> bool {
+/// Whether `layer_id` is visible (or unknown — treated as visible so nothing
+/// silently disappears). Public so other layers checking "would this render"
+/// — e.g. `cad_app` deciding whether an entity is selectable — stay in sync
+/// with what `build_render_model` actually draws.
+#[must_use]
+pub fn is_layer_visible(drawing: &Drawing, layer_id: LayerId) -> bool {
     drawing.layer(layer_id).is_none_or(|layer| layer.visible)
 }
 
-fn entity_primitive(geometry: &EntityGeometry) -> RenderPrimitive {
+/// Converts a single geometry value to its render primitive. Public so
+/// callers that need to draw or preview one entity at a time (e.g. `cad_app`
+/// highlighting a selection or previewing a drag) can reuse the exact same
+/// mapping `build_render_model` uses for the whole drawing.
+#[must_use]
+pub fn geometry_primitive(geometry: &EntityGeometry) -> RenderPrimitive {
     match geometry {
         EntityGeometry::Line(line) => RenderPrimitive::Line {
             start: (line.start.x.0, line.start.y.0),
@@ -92,7 +102,7 @@ pub fn build_render_model(project: &Project) -> Vec<RenderPrimitive> {
 
     for entity in &drawing.entities {
         if is_layer_visible(drawing, entity.layer_id) {
-            primitives.push(entity_primitive(&entity.geometry));
+            primitives.push(geometry_primitive(&entity.geometry));
         }
     }
 

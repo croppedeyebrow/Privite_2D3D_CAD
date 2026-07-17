@@ -43,6 +43,19 @@ impl From<CoreError> for CommandError {
     }
 }
 
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Core(e) => write!(f, "{e}"),
+            Self::Validation(report) => {
+                write!(f, "validation failed with {} issue(s)", report.issues.len())
+            }
+        }
+    }
+}
+
+impl std::error::Error for CommandError {}
+
 #[derive(Default)]
 pub struct CommandHistory {
     undo: Vec<HistoryEntry>,
@@ -82,6 +95,18 @@ impl CommandHistory {
         self.undo.push(HistoryEntry { command, inverse });
         self.redo.clear();
         Ok(())
+    }
+
+    /// Whether [`Self::undo`] would have an effect right now.
+    #[must_use]
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    /// Whether [`Self::redo`] would have an effect right now.
+    #[must_use]
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
     }
 
     /// Undoes the latest successful command.
@@ -309,14 +334,25 @@ mod tests {
         let entity = line_entity(1, (0.0, 0.0), (1.0, 1.0));
         let mut project = Project::default();
         let mut history = CommandHistory::default();
+        assert!(!history.can_undo());
+        assert!(!history.can_redo());
+
         history
             .execute(&mut project, DrawingCommand::AddEntity(entity))
             .expect("command succeeds");
         assert_eq!(project.drawing.entities.len(), 1);
+        assert!(history.can_undo());
+        assert!(!history.can_redo());
+
         assert!(history.undo(&mut project).expect("undo succeeds"));
         assert!(project.drawing.entities.is_empty());
+        assert!(!history.can_undo());
+        assert!(history.can_redo());
+
         assert!(history.redo(&mut project).expect("redo succeeds"));
         assert_eq!(project.drawing.entities.len(), 1);
+        assert!(history.can_undo());
+        assert!(!history.can_redo());
     }
 
     #[test]

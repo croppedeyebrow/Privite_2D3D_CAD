@@ -518,6 +518,7 @@ version = "0.1.0"
 dependencies = [
  "cad_command",
  "cad_core",
+ "cad_geometry",
  "cad_render",
  "eframe",
  "egui",

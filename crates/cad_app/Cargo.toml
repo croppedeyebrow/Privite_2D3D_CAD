@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 cad_core = { path = "../cad_core" }
+cad_geometry = { path = "../cad_geometry" }
 cad_command = { path = "../cad_command" }
 cad_render = { path = "../cad_render" }
 egui = { workspace = true }
