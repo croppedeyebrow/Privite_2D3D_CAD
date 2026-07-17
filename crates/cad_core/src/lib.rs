@@ -31,9 +31,12 @@ macro_rules! stable_id {
     };
 }
 
+stable_id!(ProjectId);
+stable_id!(DrawingId);
 stable_id!(EntityId);
 stable_id!(LayerId);
 stable_id!(DimensionId);
+stable_id!(SheetId);
 
 // ---------------------------------------------------------------------------
 // Units
@@ -189,8 +192,15 @@ pub struct Dimension {
 // Drawing and Project
 // ---------------------------------------------------------------------------
 
+/// The first drawing created inside a new project.
+pub const DEFAULT_DRAWING_ID: DrawingId = DrawingId::new(0);
+
+/// The first project created by the application.
+pub const DEFAULT_PROJECT_ID: ProjectId = ProjectId::new(0);
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Drawing {
+    pub id: DrawingId,
     pub entities: Vec<Entity>,
     pub layers: Vec<Layer>,
     pub dimensions: Vec<Dimension>,
@@ -199,6 +209,7 @@ pub struct Drawing {
 impl Default for Drawing {
     fn default() -> Self {
         Self {
+            id: DEFAULT_DRAWING_ID,
             entities: Vec::new(),
             layers: vec![Layer::new(DEFAULT_LAYER_ID, "0")],
             dimensions: Vec::new(),
@@ -206,9 +217,19 @@ impl Default for Drawing {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Project {
+    pub id: ProjectId,
     pub drawing: Drawing,
+}
+
+impl Default for Project {
+    fn default() -> Self {
+        Self {
+            id: DEFAULT_PROJECT_ID,
+            drawing: Drawing::default(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +260,50 @@ impl fmt::Display for CoreError {
 }
 
 impl std::error::Error for CoreError {}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/// Distinguishes problems that block save/export/command execution from
+/// problems the user must acknowledge but can still work around.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValidationSeverity {
+    Error,
+    Warning,
+}
+
+/// The persistent object a `ValidationIssue` applies to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValidationTarget {
+    Project(ProjectId),
+    Drawing(DrawingId),
+    Entity(EntityId),
+    Layer(LayerId),
+    Dimension(DimensionId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidationIssue {
+    pub severity: ValidationSeverity,
+    pub target: ValidationTarget,
+    pub message: String,
+    pub suggestion: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ValidationReport {
+    pub issues: Vec<ValidationIssue>,
+}
+
+impl ValidationReport {
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.issues
+            .iter()
+            .any(|issue| issue.severity == ValidationSeverity::Error)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Drawing operations
@@ -316,6 +381,42 @@ impl Drawing {
             .position(|d| d.id == id)
             .ok_or(CoreError::MissingDimension(id))?;
         Ok(self.dimensions.remove(index))
+    }
+
+    /// Checks structural invariants that saving, exporting, or running a
+    /// command must be able to rely on: every entity and dimension must
+    /// reference a layer that exists in this drawing.
+    #[must_use]
+    pub fn validate(&self) -> ValidationReport {
+        let mut issues = Vec::new();
+
+        for entity in &self.entities {
+            if self.layer(entity.layer_id).is_none() {
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Error,
+                    target: ValidationTarget::Entity(entity.id),
+                    message: format!("entity references missing layer {}", entity.layer_id),
+                    suggestion:
+                        "Create the missing layer or reassign the entity to an existing layer."
+                            .to_owned(),
+                });
+            }
+        }
+
+        for dim in &self.dimensions {
+            if self.layer(dim.layer_id).is_none() {
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Error,
+                    target: ValidationTarget::Dimension(dim.id),
+                    message: format!("dimension references missing layer {}", dim.layer_id),
+                    suggestion:
+                        "Create the missing layer or reassign the dimension to an existing layer."
+                            .to_owned(),
+                });
+            }
+        }
+
+        ValidationReport { issues }
     }
 }
 
@@ -447,5 +548,68 @@ mod tests {
             drawing.add_entity(e).expect("entity should be added");
         }
         assert_eq!(drawing.entities.len(), 5);
+    }
+
+    #[test]
+    fn default_project_and_drawing_use_id_zero() {
+        let project = Project::default();
+        assert_eq!(project.id, DEFAULT_PROJECT_ID);
+        assert_eq!(project.drawing.id, DEFAULT_DRAWING_ID);
+    }
+
+    #[test]
+    fn validate_reports_no_issues_for_a_default_drawing() {
+        let drawing = Drawing::default();
+        let report = drawing.validate();
+        assert!(!report.has_errors());
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn validate_detects_entity_referencing_missing_layer() {
+        let mut drawing = Drawing::default();
+        let missing_layer = LayerId::new(99);
+        drawing
+            .add_entity(Entity {
+                id: EntityId::new(1),
+                layer_id: missing_layer,
+                geometry: EntityGeometry::Line(Line {
+                    start: Point2::new(0.0, 0.0),
+                    end: Point2::new(1.0, 1.0),
+                }),
+            })
+            .unwrap();
+
+        let report = drawing.validate();
+        assert!(report.has_errors());
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(
+            report.issues[0].target,
+            ValidationTarget::Entity(EntityId::new(1))
+        );
+        assert_eq!(report.issues[0].severity, ValidationSeverity::Error);
+    }
+
+    #[test]
+    fn validate_detects_dimension_referencing_missing_layer() {
+        let mut drawing = Drawing::default();
+        let missing_layer = LayerId::new(99);
+        drawing
+            .add_dimension(Dimension {
+                id: DimensionId::new(1),
+                kind: DimensionKind::Linear,
+                start: Point2::new(0.0, 0.0),
+                end: Point2::new(100.0, 0.0),
+                offset: LengthMm(10.0),
+                layer_id: missing_layer,
+            })
+            .unwrap();
+
+        let report = drawing.validate();
+        assert!(report.has_errors());
+        assert_eq!(
+            report.issues[0].target,
+            ValidationTarget::Dimension(DimensionId::new(1))
+        );
     }
 }
