@@ -218,6 +218,23 @@ fn backup_file_name(stem: &str) -> String {
     format!("{stem}_{millis:016}_{seq:06}.cadproj")
 }
 
+/// Finds the most recent backup for the project at `path`, if any exist.
+#[must_use]
+pub fn latest_backup(path: &Path) -> Option<PathBuf> {
+    let backups_dir = backups_dir_for(path);
+    let stem = path.file_stem()?.to_str()?;
+    let prefix = format!("{stem}_");
+
+    let mut names: Vec<String> = fs::read_dir(&backups_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with(&prefix) && name.ends_with(".cadproj"))
+        .collect();
+    names.sort();
+    names.pop().map(|name| backups_dir.join(name))
+}
+
 fn update_backup(path: &Path) -> Result<(), IoError> {
     let backups_dir = backups_dir_for(path);
     fs::create_dir_all(&backups_dir)?;
@@ -529,6 +546,29 @@ mod tests {
         let backups: Vec<_> = fs::read_dir(&backups_dir).unwrap().collect();
         assert_eq!(backups.len(), 1);
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn latest_backup_finds_the_most_recent_one() {
+        let dir = temp_dir();
+        let path = dir.join("test.cadproj");
+        let project = sample_project();
+        save_project(&project, &path).unwrap();
+        save_project(&project, &path).unwrap();
+
+        let found = latest_backup(&path);
+        assert!(found.is_some());
+        assert!(found.unwrap().starts_with(dir.join("backups")));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn latest_backup_is_none_when_no_backups_exist() {
+        let dir = temp_dir();
+        let path = dir.join("untouched.cadproj");
+        assert!(latest_backup(&path).is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
