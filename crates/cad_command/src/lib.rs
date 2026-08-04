@@ -21,9 +21,22 @@ pub enum DrawingCommand {
         id: EntityId,
         layer_id: LayerId,
     },
+    /// Replaces an entity's geometry wholesale (property panel edits).
+    SetEntityGeometry {
+        id: EntityId,
+        geometry: EntityGeometry,
+    },
     AddLayer(Layer),
     RemoveLayer {
         id: LayerId,
+    },
+    SetLayerVisible {
+        id: LayerId,
+        visible: bool,
+    },
+    SetLayerLocked {
+        id: LayerId,
+        locked: bool,
     },
     AddDimension(Dimension),
     RemoveDimension {
@@ -167,6 +180,14 @@ fn find_entity_mut(drawing: &mut Drawing, id: EntityId) -> Result<&mut Entity, C
         .ok_or(CoreError::MissingEntity(id))
 }
 
+fn find_layer_mut(drawing: &mut Drawing, id: LayerId) -> Result<&mut Layer, CoreError> {
+    drawing
+        .layers
+        .iter_mut()
+        .find(|layer| layer.id == id)
+        .ok_or(CoreError::MissingLayer(id))
+}
+
 fn translate_geometry(geometry: &EntityGeometry, dx: LengthMm, dy: LengthMm) -> EntityGeometry {
     let shift = |p: Point2| cad_geometry::translate_point(p, dx, dy);
     match geometry {
@@ -214,9 +235,18 @@ fn apply(project: &mut Project, command: &DrawingCommand) -> Result<(), CommandE
         DrawingCommand::SetEntityLayer { id, layer_id } => {
             find_entity_mut(drawing(project), *id)?.layer_id = *layer_id;
         }
+        DrawingCommand::SetEntityGeometry { id, geometry } => {
+            find_entity_mut(drawing(project), *id)?.geometry = geometry.clone();
+        }
         DrawingCommand::AddLayer(layer) => drawing(project).add_layer(layer.clone())?,
         DrawingCommand::RemoveLayer { id } => {
             drawing(project).remove_layer(*id)?;
+        }
+        DrawingCommand::SetLayerVisible { id, visible } => {
+            find_layer_mut(drawing(project), *id)?.visible = *visible;
+        }
+        DrawingCommand::SetLayerLocked { id, locked } => {
+            find_layer_mut(drawing(project), *id)?.locked = *locked;
         }
         DrawingCommand::AddDimension(dim) => drawing(project).add_dimension(dim.clone())?,
         DrawingCommand::RemoveDimension { id } => {
@@ -259,6 +289,20 @@ fn inverse(
                 layer_id: current_layer_id,
             }
         }
+        DrawingCommand::SetEntityGeometry { id, .. } => {
+            let current_geometry = project
+                .drawing
+                .entities
+                .iter()
+                .find(|entity| entity.id == *id)
+                .ok_or(CoreError::MissingEntity(*id))?
+                .geometry
+                .clone();
+            DrawingCommand::SetEntityGeometry {
+                id: *id,
+                geometry: current_geometry,
+            }
+        }
         DrawingCommand::AddLayer(layer) => DrawingCommand::RemoveLayer { id: layer.id },
         DrawingCommand::RemoveLayer { id } => DrawingCommand::AddLayer(
             project
@@ -267,6 +311,28 @@ fn inverse(
                 .cloned()
                 .ok_or(CoreError::MissingLayer(*id))?,
         ),
+        DrawingCommand::SetLayerVisible { id, .. } => {
+            let current = project
+                .drawing
+                .layer(*id)
+                .ok_or(CoreError::MissingLayer(*id))?
+                .visible;
+            DrawingCommand::SetLayerVisible {
+                id: *id,
+                visible: current,
+            }
+        }
+        DrawingCommand::SetLayerLocked { id, .. } => {
+            let current = project
+                .drawing
+                .layer(*id)
+                .ok_or(CoreError::MissingLayer(*id))?
+                .locked;
+            DrawingCommand::SetLayerLocked {
+                id: *id,
+                locked: current,
+            }
+        }
         DrawingCommand::AddDimension(dim) => DrawingCommand::RemoveDimension { id: dim.id },
         DrawingCommand::RemoveDimension { id } => DrawingCommand::AddDimension(
             project
@@ -428,6 +494,108 @@ mod tests {
 
         assert!(history.undo(&mut project).unwrap());
         assert_eq!(project.drawing.entities[0].layer_id, DEFAULT_LAYER_ID);
+    }
+
+    #[test]
+    fn set_entity_geometry_replaces_geometry_and_can_be_undone() {
+        let mut project = Project::default();
+        let mut history = CommandHistory::default();
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::AddEntity(line_entity(1, (0.0, 0.0), (10.0, 0.0))),
+            )
+            .unwrap();
+
+        let new_geometry = EntityGeometry::Line(Line {
+            start: Point2::new(0.0, 0.0),
+            end: Point2::new(99.0, 0.0),
+        });
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::SetEntityGeometry {
+                    id: EntityId::new(1),
+                    geometry: new_geometry.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(project.drawing.entities[0].geometry, new_geometry);
+
+        assert!(history.undo(&mut project).unwrap());
+        assert_eq!(
+            project.drawing.entities[0].geometry,
+            EntityGeometry::Line(Line {
+                start: Point2::new(0.0, 0.0),
+                end: Point2::new(10.0, 0.0),
+            })
+        );
+    }
+
+    #[test]
+    fn set_entity_geometry_rejects_invalid_result_and_rolls_back() {
+        let mut project = Project::default();
+        let mut history = CommandHistory::default();
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::AddEntity(line_entity(1, (0.0, 0.0), (10.0, 0.0))),
+            )
+            .unwrap();
+
+        let degenerate = EntityGeometry::Line(Line {
+            start: Point2::new(5.0, 5.0),
+            end: Point2::new(5.0, 5.0),
+        });
+        let result = history.execute(
+            &mut project,
+            DrawingCommand::SetEntityGeometry {
+                id: EntityId::new(1),
+                geometry: degenerate,
+            },
+        );
+        assert!(matches!(result, Err(CommandError::Validation(_))));
+        assert_eq!(
+            project.drawing.entities[0].geometry,
+            EntityGeometry::Line(Line {
+                start: Point2::new(0.0, 0.0),
+                end: Point2::new(10.0, 0.0),
+            })
+        );
+    }
+
+    #[test]
+    fn set_layer_visible_and_locked_can_be_undone() {
+        let mut project = Project::default();
+        let mut history = CommandHistory::default();
+
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::SetLayerVisible {
+                    id: DEFAULT_LAYER_ID,
+                    visible: false,
+                },
+            )
+            .unwrap();
+        assert!(!project.drawing.layer(DEFAULT_LAYER_ID).unwrap().visible);
+
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::SetLayerLocked {
+                    id: DEFAULT_LAYER_ID,
+                    locked: true,
+                },
+            )
+            .unwrap();
+        assert!(project.drawing.layer(DEFAULT_LAYER_ID).unwrap().locked);
+
+        assert!(history.undo(&mut project).unwrap());
+        assert!(!project.drawing.layer(DEFAULT_LAYER_ID).unwrap().locked);
+
+        assert!(history.undo(&mut project).unwrap());
+        assert!(project.drawing.layer(DEFAULT_LAYER_ID).unwrap().visible);
     }
 
     #[test]

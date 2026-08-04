@@ -98,6 +98,16 @@ pub fn circle_geometry(center: (f64, f64), edge: (f64, f64)) -> EntityGeometry {
     })
 }
 
+/// Normalizes `end_angle - start_angle` into a positive counter-clockwise
+/// sweep, matching `cad_core::Arc`'s "positive sweep = CCW" convention.
+fn ccw_sweep(start_angle: f64, end_angle: f64) -> f64 {
+    let mut sweep = end_angle - start_angle;
+    while sweep <= 0.0 {
+        sweep += std::f64::consts::TAU;
+    }
+    sweep
+}
+
 /// Builds an arc from a center, a point defining the radius and start
 /// angle, and a point defining only the end angle (its distance from the
 /// center is ignored). The sweep always goes counter-clockwise from start
@@ -112,17 +122,45 @@ pub fn arc_geometry(center: (f64, f64), start: (f64, f64), end: (f64, f64)) -> E
     let start_angle = (start.1 - center.1).atan2(start.0 - center.0);
     let end_angle = (end.1 - center.1).atan2(end.0 - center.0);
 
-    let mut sweep = end_angle - start_angle;
-    while sweep <= 0.0 {
-        sweep += std::f64::consts::TAU;
-    }
-
     EntityGeometry::Arc(Arc {
         center: Point2::new(center.0, center.1),
         radius,
         start_angle: AngleRad(start_angle),
-        sweep_angle: AngleRad(sweep),
+        sweep_angle: AngleRad(ccw_sweep(start_angle, end_angle)),
     })
+}
+
+/// A short, human-readable measurement of the shape currently being drawn,
+/// updated live against the (already-snapped) pointer position. `None` when
+/// the tool isn't mid-draw (nothing to measure yet) or is the select tool.
+#[must_use]
+pub fn preview_measurement(draw_state: &DrawState, hover: (f64, f64)) -> Option<String> {
+    let dist = |a: (f64, f64), b: (f64, f64)| {
+        cad_geometry::distance(Point2::new(a.0, a.1), Point2::new(b.0, b.1)).0
+    };
+
+    match draw_state {
+        DrawState::LineStart(start) => Some(format!("길이: {:.2} mm", dist(*start, hover))),
+        DrawState::RectangleStart(start) => Some(format!(
+            "폭: {:.2} mm, 높이: {:.2} mm",
+            (hover.0 - start.0).abs(),
+            (hover.1 - start.1).abs()
+        )),
+        DrawState::CircleCenter(center) | DrawState::ArcCenter(center) => {
+            Some(format!("반지름: {:.2} mm", dist(*center, hover)))
+        }
+        DrawState::ArcStart { center, start } => {
+            let start_angle = (start.1 - center.1).atan2(start.0 - center.0);
+            let end_angle = (hover.1 - center.1).atan2(hover.0 - center.0);
+            let sweep = ccw_sweep(start_angle, end_angle);
+            Some(format!(
+                "반지름: {:.2} mm, 각도: {:.1}°",
+                dist(*center, *start),
+                sweep.to_degrees()
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[must_use]
@@ -309,5 +347,49 @@ mod tests {
     fn snap_point_returns_raw_point_when_nothing_in_range() {
         let drawing = drawing_with_line((0.0, 0.0), (10.0, 0.0));
         assert_eq!(snap_point(&drawing, (5.0, 5.0), 1.0), (5.0, 5.0));
+    }
+
+    #[test]
+    fn preview_measurement_reports_line_length() {
+        let state = DrawState::LineStart((0.0, 0.0));
+        assert_eq!(
+            preview_measurement(&state, (3.0, 4.0)),
+            Some("길이: 5.00 mm".to_owned())
+        );
+    }
+
+    #[test]
+    fn preview_measurement_reports_rectangle_width_and_height() {
+        let state = DrawState::RectangleStart((0.0, 0.0));
+        assert_eq!(
+            preview_measurement(&state, (10.0, -5.0)),
+            Some("폭: 10.00 mm, 높이: 5.00 mm".to_owned())
+        );
+    }
+
+    #[test]
+    fn preview_measurement_reports_circle_radius() {
+        let state = DrawState::CircleCenter((0.0, 0.0));
+        assert_eq!(
+            preview_measurement(&state, (3.0, 4.0)),
+            Some("반지름: 5.00 mm".to_owned())
+        );
+    }
+
+    #[test]
+    fn preview_measurement_reports_arc_radius_and_angle() {
+        let state = DrawState::ArcStart {
+            center: (0.0, 0.0),
+            start: (1.0, 0.0),
+        };
+        assert_eq!(
+            preview_measurement(&state, (0.0, 1.0)),
+            Some("반지름: 1.00 mm, 각도: 90.0°".to_owned())
+        );
+    }
+
+    #[test]
+    fn preview_measurement_is_none_when_idle() {
+        assert_eq!(preview_measurement(&DrawState::Idle, (1.0, 1.0)), None);
     }
 }

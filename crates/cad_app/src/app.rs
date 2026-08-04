@@ -3,7 +3,9 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use cad_command::{CommandHistory, DrawingCommand};
-use cad_core::{Entity, EntityGeometry, EntityId, LayerId, LengthMm, Project, DEFAULT_LAYER_ID};
+use cad_core::{
+    AngleRad, Entity, EntityGeometry, EntityId, LayerId, LengthMm, Project, DEFAULT_LAYER_ID,
+};
 use cad_render::RenderPrimitive;
 
 use crate::camera::Camera;
@@ -12,9 +14,23 @@ use crate::tool::{self, DrawState, Tool};
 
 const PICK_TOLERANCE_PX: f32 = 8.0;
 
-/// The `04_UI_와이어프레임_정책.md` layout, now with working tools: select,
-/// draw five entity shapes, move the selection, undo/redo. File operations
-/// and property editing are still placeholders — Phase 8c/8d.
+/// A working copy of the selected entity's geometry, edited by the
+/// property panel's fields. Kept separate from `Project` so a multi-frame
+/// drag on a `DragValue` has somewhere to accumulate before it's committed
+/// as a single `SetEntityGeometry` (same reasoning as `DrawState::Moving`
+/// in Phase 8b: one undo step per user gesture, not one per frame).
+struct PropertyEdit {
+    entity_id: EntityId,
+    draft: EntityGeometry,
+    /// True while a field is actively being dragged or has keyboard focus.
+    /// While true, the draft is not overwritten by the live project value.
+    editing: bool,
+}
+
+/// The `04_UI_와이어프레임_정책.md` layout: menu, tool bar, left (layers),
+/// center (canvas), right (validation + properties), bottom (status).
+/// Drawing, selection, movement, undo/redo, and property/layer editing all
+/// work; only file operations remain — Phase 8d.
 pub struct CadApp {
     project: Project,
     camera: Camera,
@@ -22,6 +38,7 @@ pub struct CadApp {
     tool: Tool,
     draw_state: DrawState,
     selection: Option<EntityId>,
+    property_edit: Option<PropertyEdit>,
     current_layer: LayerId,
     next_entity_id: u64,
     status_message: Option<String>,
@@ -45,6 +62,7 @@ impl Default for CadApp {
             tool: Tool::Select,
             draw_state: DrawState::Idle,
             selection: None,
+            property_edit: None,
             current_layer: DEFAULT_LAYER_ID,
             next_entity_id,
             status_message: None,
@@ -198,36 +216,103 @@ impl CadApp {
     }
 
     fn left_panel(&mut self, ctx: &egui::Context) {
+        let layers = self.project.drawing.layers.clone();
+        let current_layer = self.current_layer;
+        let mut visibility_toggle: Option<(LayerId, bool)> = None;
+        let mut lock_toggle: Option<(LayerId, bool)> = None;
+        let mut new_current_layer: Option<LayerId> = None;
+
         egui::SidePanel::left("left_panel")
             .resizable(true)
-            .default_width(180.0)
+            .default_width(200.0)
             .show(ctx, |ui| {
                 ui.heading("레이어");
-                ui.weak("클릭하면 그리기 대상 레이어로 지정됩니다.");
-                for layer in self.project.drawing.layers.clone() {
+                ui.weak("이름을 클릭하면 그리기 대상 레이어로 지정됩니다.");
+                for layer in &layers {
                     ui.horizontal(|ui| {
                         let mut visible = layer.visible;
-                        ui.add_enabled(false, egui::Checkbox::new(&mut visible, ""));
+                        if ui.checkbox(&mut visible, "").changed() {
+                            visibility_toggle = Some((layer.id, visible));
+                        }
+                        let mut locked = layer.locked;
+                        if ui.checkbox(&mut locked, "🔒").changed() {
+                            lock_toggle = Some((layer.id, locked));
+                        }
                         if ui
-                            .selectable_label(self.current_layer == layer.id, &layer.name)
+                            .selectable_label(current_layer == layer.id, &layer.name)
                             .clicked()
                         {
-                            self.current_layer = layer.id;
+                            new_current_layer = Some(layer.id);
                         }
                     });
                 }
-                ui.add_space(8.0);
-                ui.weak("가시성/잠금 편집은 Phase 8c 예정");
+            });
+
+        // Executed after `.show` returns so these don't need `&mut self`
+        // while the panel closure above is (immutably) reading `layers`.
+        if let Some((id, visible)) = visibility_toggle {
+            self.execute(DrawingCommand::SetLayerVisible { id, visible });
+        }
+        if let Some((id, locked)) = lock_toggle {
+            self.execute(DrawingCommand::SetLayerLocked { id, locked });
+        }
+        if let Some(id) = new_current_layer {
+            self.current_layer = id;
+        }
+    }
+
+    /// Keeps `property_edit` pointed at the current selection. Does nothing
+    /// while a field is actively being dragged/typed into, so an in-progress
+    /// edit is never clobbered by a fresh clone of the (not-yet-updated)
+    /// project entity.
+    fn sync_property_edit(&mut self) {
+        let Some(id) = self.selection else {
+            self.property_edit = None;
+            return;
+        };
+
+        let currently_editing = self
+            .property_edit
+            .as_ref()
+            .is_some_and(|edit| edit.entity_id == id && edit.editing);
+        if currently_editing {
+            return;
+        }
+
+        self.property_edit = self
+            .project
+            .drawing
+            .entities
+            .iter()
+            .find(|entity| entity.id == id)
+            .map(|entity| PropertyEdit {
+                entity_id: id,
+                draft: entity.geometry.clone(),
+                editing: false,
             });
     }
 
     fn right_panel(&mut self, ctx: &egui::Context) {
+        self.sync_property_edit();
+
+        let report = self.project.drawing.validate();
+        let status_message = self.status_message.clone();
+        let selected = self.selection.and_then(|id| {
+            self.project
+                .drawing
+                .entities
+                .iter()
+                .find(|entity| entity.id == id)
+                .map(|entity| (entity.id, geometry_kind_label(&entity.geometry)))
+        });
+        let mut draft = self.property_edit.as_ref().map(|edit| edit.draft.clone());
+        let mut outcome = FieldEditOutcome::default();
+
         egui::SidePanel::right("right_panel")
             .resizable(true)
-            .default_width(240.0)
+            .default_width(260.0)
             .show(ctx, |ui| {
                 ui.heading("검증");
-                let report = self.project.drawing.validate();
                 if report.issues.is_empty() {
                     ui.colored_label(egui::Color32::LIGHT_GREEN, "문제 없음");
                 } else {
@@ -236,30 +321,38 @@ impl CadApp {
                         ui.weak(&issue.suggestion);
                     }
                 }
-                if let Some(message) = &self.status_message {
+                if let Some(message) = &status_message {
                     ui.add_space(8.0);
                     ui.colored_label(egui::Color32::LIGHT_RED, message);
                 }
 
                 ui.add_space(8.0);
                 ui.heading("속성");
-                match self.selection.and_then(|id| {
-                    self.project
-                        .drawing
-                        .entities
-                        .iter()
-                        .find(|entity| entity.id == id)
-                }) {
-                    Some(entity) => {
-                        ui.label(format!("id: {}", entity.id));
-                        ui.label(format!("종류: {}", geometry_kind_label(&entity.geometry)));
-                        ui.weak("값 편집은 Phase 8c 예정");
+                match (&selected, &mut draft) {
+                    (Some((id, kind)), Some(geometry)) => {
+                        ui.label(format!("id: {id}"));
+                        ui.label(format!("종류: {kind}"));
+                        ui.separator();
+                        outcome = edit_geometry_fields(ui, geometry);
                     }
-                    None => {
+                    _ => {
                         ui.weak("선택된 엔티티 없음");
                     }
                 }
             });
+
+        let (Some((id, _)), Some(geometry)) = (selected, draft) else {
+            return;
+        };
+        if outcome.commit {
+            self.execute(DrawingCommand::SetEntityGeometry { id, geometry });
+            if let Some(edit) = &mut self.property_edit {
+                edit.editing = false;
+            }
+        } else if let Some(edit) = &mut self.property_edit {
+            edit.draft = geometry;
+            edit.editing = outcome.editing;
+        }
     }
 
     /// Draws the canvas, handles pan/zoom/tool interaction, and returns the
@@ -338,6 +431,18 @@ impl CadApp {
                             egui::pos2(x, y),
                             5.0,
                             egui::Stroke::new(1.5, egui::Color32::YELLOW),
+                        );
+                    }
+                }
+                if let Some(snapped) = snapped_hover {
+                    if let Some(text) = tool::preview_measurement(&self.draw_state, snapped) {
+                        let (x, y) = self.camera.world_to_screen(center, snapped);
+                        painter.text(
+                            egui::pos2(x + 14.0, y - 14.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            text,
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::from_rgb(255, 210, 90),
                         );
                     }
                 }
@@ -563,6 +668,104 @@ fn geometry_kind_label(geometry: &EntityGeometry) -> &'static str {
         EntityGeometry::Arc(_) => "호",
         EntityGeometry::Text(_) => "텍스트",
     }
+}
+
+/// Whether the property panel's edits this frame should be committed as a
+/// `SetEntityGeometry`, and whether a field is still mid-interaction (see
+/// `PropertyEdit::editing`).
+#[derive(Default)]
+struct FieldEditOutcome {
+    commit: bool,
+    editing: bool,
+}
+
+fn number_field(ui: &mut egui::Ui, outcome: &mut FieldEditOutcome, label: &str, value: &mut f64) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui.add(egui::DragValue::new(value).speed(0.5).suffix(" mm"));
+        if response.dragged() || response.has_focus() {
+            outcome.editing = true;
+        }
+        if response.drag_stopped() || response.lost_focus() {
+            outcome.commit = true;
+        }
+    });
+}
+
+fn angle_field_degrees(
+    ui: &mut egui::Ui,
+    outcome: &mut FieldEditOutcome,
+    label: &str,
+    angle: &mut AngleRad,
+) {
+    let mut degrees = angle.0.to_degrees();
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui.add(egui::DragValue::new(&mut degrees).speed(1.0).suffix("°"));
+        if response.dragged() || response.has_focus() {
+            outcome.editing = true;
+        }
+        if response.drag_stopped() || response.lost_focus() {
+            outcome.commit = true;
+        }
+    });
+    angle.0 = degrees.to_radians();
+}
+
+/// Renders editable fields for whichever geometry variant is selected.
+/// Every field follows the same rule as canvas dragging (Phase 8b): the
+/// displayed value updates live, but `outcome.commit` — and therefore the
+/// `SetEntityGeometry` command — only fires once the drag/typing ends, so
+/// one property edit is one undo step.
+fn edit_geometry_fields(ui: &mut egui::Ui, geometry: &mut EntityGeometry) -> FieldEditOutcome {
+    let mut outcome = FieldEditOutcome::default();
+
+    match geometry {
+        EntityGeometry::Line(line) => {
+            number_field(ui, &mut outcome, "시작 x", &mut line.start.x.0);
+            number_field(ui, &mut outcome, "시작 y", &mut line.start.y.0);
+            number_field(ui, &mut outcome, "끝 x", &mut line.end.x.0);
+            number_field(ui, &mut outcome, "끝 y", &mut line.end.y.0);
+        }
+        EntityGeometry::Rectangle(rect) => {
+            number_field(ui, &mut outcome, "원점 x", &mut rect.origin.x.0);
+            number_field(ui, &mut outcome, "원점 y", &mut rect.origin.y.0);
+            number_field(ui, &mut outcome, "폭", &mut rect.width.0);
+            number_field(ui, &mut outcome, "높이", &mut rect.height.0);
+        }
+        EntityGeometry::Circle(circle) => {
+            number_field(ui, &mut outcome, "중심 x", &mut circle.center.x.0);
+            number_field(ui, &mut outcome, "중심 y", &mut circle.center.y.0);
+            number_field(ui, &mut outcome, "반지름", &mut circle.radius.0);
+        }
+        EntityGeometry::Arc(arc) => {
+            number_field(ui, &mut outcome, "중심 x", &mut arc.center.x.0);
+            number_field(ui, &mut outcome, "중심 y", &mut arc.center.y.0);
+            number_field(ui, &mut outcome, "반지름", &mut arc.radius.0);
+            angle_field_degrees(ui, &mut outcome, "시작각", &mut arc.start_angle);
+            angle_field_degrees(ui, &mut outcome, "스윕각", &mut arc.sweep_angle);
+        }
+        EntityGeometry::Text(text) => {
+            ui.horizontal(|ui| {
+                ui.label("내용");
+                let response = ui.text_edit_singleline(&mut text.content);
+                if response.has_focus() {
+                    outcome.editing = true;
+                }
+                if response.lost_focus() {
+                    outcome.commit = true;
+                }
+            });
+            number_field(ui, &mut outcome, "원점 x", &mut text.origin.x.0);
+            number_field(ui, &mut outcome, "원점 y", &mut text.origin.y.0);
+            number_field(ui, &mut outcome, "높이", &mut text.height.0);
+        }
+        EntityGeometry::Polyline(_) => {
+            ui.weak("폴리라인 속성 편집은 아직 지원하지 않습니다.");
+        }
+    }
+
+    outcome
 }
 
 fn draw_geometry(
