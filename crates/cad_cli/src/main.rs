@@ -140,8 +140,9 @@ fn run_recover(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 
 /// Writes the recovered project to `<name>.recovered.cadproj`. The original
 /// file at `original` is never overwritten — recovery always produces a new
-/// file so the user can compare and decide (`file_save_docs.md` 7.3:
-/// "원본 파일을 직접 덮어쓰지 않는다").
+/// file so the user can compare and decide
+/// (`05_데이터베이스_파일저장_영속_설계.md` 3절: "Restore는 사용자 승인 후
+/// `Recovered Copy` 이름으로 열고 원본 자동 덮어쓰기 금지").
 fn finish_recovery(project: &Project, original: &Path, source: &Path) -> Result<(), String> {
     let recovered_path = original.with_extension("recovered.cadproj");
     cad_io::save_project(project, &recovered_path).map_err(|e| {

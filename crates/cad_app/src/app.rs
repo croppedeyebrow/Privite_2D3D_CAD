@@ -30,8 +30,10 @@ struct PropertyEdit {
     editing: bool,
 }
 
-/// The `04_UI_와이어프레임_정책.md` layout: menu, tool bar, left (layers),
-/// center (canvas), right (validation + properties), bottom (status).
+/// The layout from `03_프론트엔드_데스크톱_GUI_UX.md` 2절 (기본 화면) with the
+/// Drafting workbench's panels (Layers / Properties / Validation, per the
+/// 워크벤치 화면별 계약 table): menu, tool bar, left (layers), center
+/// (canvas), right (validation + properties), bottom (status).
 /// Drawing, multi-selection (click, shift-click, box select), grouping,
 /// movement, deletion, undo/redo, and property/layer editing all work.
 /// Still missing: file open/save from the GUI, and the dimension tool
