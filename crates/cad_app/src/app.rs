@@ -2,9 +2,12 @@
 // from `f64` world coordinates; see camera.rs for why the truncation is fine.
 #![allow(clippy::cast_possible_truncation)]
 
+use std::collections::HashSet;
+
 use cad_command::{CommandHistory, DrawingCommand};
 use cad_core::{
-    AngleRad, Entity, EntityGeometry, EntityId, LayerId, LengthMm, Project, DEFAULT_LAYER_ID,
+    AngleRad, Entity, EntityGeometry, EntityId, Group, GroupId, LayerId, LengthMm, Project,
+    DEFAULT_LAYER_ID,
 };
 use cad_render::RenderPrimitive;
 
@@ -29,18 +32,24 @@ struct PropertyEdit {
 
 /// The `04_UI_와이어프레임_정책.md` layout: menu, tool bar, left (layers),
 /// center (canvas), right (validation + properties), bottom (status).
-/// Drawing, selection, movement, undo/redo, and property/layer editing all
-/// work; only file operations remain — Phase 8d.
+/// Drawing, multi-selection (click, shift-click, box select), grouping,
+/// movement, deletion, undo/redo, and property/layer editing all work.
+/// Still missing: file open/save from the GUI, and the dimension tool
+/// (its placement rules are not settled yet — see Phase 5·6 notes).
 pub struct CadApp {
     project: Project,
     camera: Camera,
     history: CommandHistory,
     tool: Tool,
     draw_state: DrawState,
-    selection: Option<EntityId>,
+    /// The current selection. A `HashSet` rather than a `Vec` because
+    /// membership tests (`contains`) happen every frame while dragging or
+    /// box-selecting, and duplicates would be meaningless anyway.
+    selection: HashSet<EntityId>,
     property_edit: Option<PropertyEdit>,
     current_layer: LayerId,
     next_entity_id: u64,
+    next_group_id: u64,
     status_message: Option<String>,
 }
 
@@ -54,6 +63,13 @@ impl Default for CadApp {
             .map(|e| e.id.value())
             .max()
             .map_or(1, |max| max + 1);
+        let next_group_id = project
+            .drawing
+            .groups
+            .iter()
+            .map(|g| g.id.value())
+            .max()
+            .map_or(1, |max| max + 1);
 
         Self {
             project,
@@ -61,10 +77,11 @@ impl Default for CadApp {
             history: CommandHistory::default(),
             tool: Tool::Select,
             draw_state: DrawState::Idle,
-            selection: None,
+            selection: HashSet::new(),
             property_edit: None,
             current_layer: DEFAULT_LAYER_ID,
             next_entity_id,
+            next_group_id,
             status_message: None,
         }
     }
@@ -84,11 +101,16 @@ impl eframe::App for CadApp {
 
 impl CadApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (undo_pressed, redo_pressed, escape_pressed) = ctx.input(|i| {
+        let (undo_pressed, redo_pressed, escape_pressed, delete_pressed) = ctx.input(|i| {
             let undo = i.key_pressed(egui::Key::Z) && i.modifiers.command && !i.modifiers.shift;
             let redo = (i.key_pressed(egui::Key::Y) && i.modifiers.command)
                 || (i.key_pressed(egui::Key::Z) && i.modifiers.command && i.modifiers.shift);
-            (undo, redo, i.key_pressed(egui::Key::Escape))
+            (
+                undo,
+                redo,
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Delete),
+            )
         });
         if undo_pressed {
             self.undo();
@@ -98,6 +120,66 @@ impl CadApp {
         }
         if escape_pressed {
             self.draw_state = DrawState::Idle;
+        }
+        if delete_pressed {
+            self.delete_selection();
+        }
+    }
+
+    /// Deletes every selected entity. Each deletion is its own undo step
+    /// (there is no batch `DeleteEntities` command yet) — undoing a bulk
+    /// delete brings entities back one at a time rather than all at once.
+    fn delete_selection(&mut self) {
+        for id in std::mem::take(&mut self.selection) {
+            self.execute(DrawingCommand::DeleteEntity { id });
+        }
+    }
+
+    /// Whether the current selection is eligible to become a new group:
+    /// two or more entities, none of which already belong to a group
+    /// (grouping an already-grouped entity into a second group isn't
+    /// supported — ungroup it first).
+    fn can_group_selection(&self) -> bool {
+        self.selection.len() >= 2
+            && self
+                .selection
+                .iter()
+                .all(|id| self.project.drawing.group_containing(*id).is_none())
+    }
+
+    /// The group the entire selection belongs to, if every selected entity
+    /// shares the same one. `None` if the selection is empty, ungrouped, or
+    /// spans more than one group.
+    fn selection_group_id(&self) -> Option<GroupId> {
+        let mut ids = self
+            .selection
+            .iter()
+            .map(|id| self.project.drawing.group_containing(*id).map(|g| g.id));
+        let first = ids.next()?;
+        if ids.all(|next| next == first) {
+            first
+        } else {
+            None
+        }
+    }
+
+    fn group_selection(&mut self) {
+        if !self.can_group_selection() {
+            return;
+        }
+        let id = GroupId::new(self.next_group_id);
+        self.next_group_id += 1;
+        let group = Group {
+            id,
+            name: format!("그룹 {}", id.value()),
+            member_ids: self.selection.iter().copied().collect(),
+        };
+        self.execute(DrawingCommand::GroupEntities(group));
+    }
+
+    fn ungroup_selection(&mut self) {
+        if let Some(group_id) = self.selection_group_id() {
+            self.execute(DrawingCommand::UngroupEntities { group_id });
         }
     }
 
@@ -200,6 +282,23 @@ impl CadApp {
 
                 ui.separator();
                 if ui
+                    .add_enabled(self.can_group_selection(), egui::Button::new("그룹"))
+                    .clicked()
+                {
+                    self.group_selection();
+                }
+                if ui
+                    .add_enabled(
+                        self.selection_group_id().is_some(),
+                        egui::Button::new("그룹 해제"),
+                    )
+                    .clicked()
+                {
+                    self.ungroup_selection();
+                }
+
+                ui.separator();
+                if ui
                     .add_enabled(self.history.can_undo(), egui::Button::new("실행 취소"))
                     .clicked()
                 {
@@ -261,12 +360,21 @@ impl CadApp {
         }
     }
 
+    /// The selected entity when exactly one is selected. The property panel
+    /// edits a single entity's geometry, so a multi-selection (or an empty
+    /// one) has nothing to show.
+    fn single_selection(&self) -> Option<EntityId> {
+        let mut ids = self.selection.iter().copied();
+        let only = ids.next()?;
+        ids.next().is_none().then_some(only)
+    }
+
     /// Keeps `property_edit` pointed at the current selection. Does nothing
     /// while a field is actively being dragged/typed into, so an in-progress
     /// edit is never clobbered by a fresh clone of the (not-yet-updated)
     /// project entity.
     fn sync_property_edit(&mut self) {
-        let Some(id) = self.selection else {
+        let Some(id) = self.single_selection() else {
             self.property_edit = None;
             return;
         };
@@ -297,7 +405,7 @@ impl CadApp {
 
         let report = self.project.drawing.validate();
         let status_message = self.status_message.clone();
-        let selected = self.selection.and_then(|id| {
+        let selected = self.single_selection().and_then(|id| {
             self.project
                 .drawing
                 .entities
@@ -305,6 +413,7 @@ impl CadApp {
                 .find(|entity| entity.id == id)
                 .map(|entity| (entity.id, geometry_kind_label(&entity.geometry)))
         });
+        let multi_selection_count = (self.selection.len() > 1).then_some(self.selection.len());
         let mut draft = self.property_edit.as_ref().map(|edit| edit.draft.clone());
         let mut outcome = FieldEditOutcome::default();
 
@@ -336,7 +445,13 @@ impl CadApp {
                         outcome = edit_geometry_fields(ui, geometry);
                     }
                     _ => {
-                        ui.weak("선택된 엔티티 없음");
+                        if let Some(count) = multi_selection_count {
+                            ui.weak(format!(
+                                "{count}개 선택됨 — 속성 편집은 하나만 선택했을 때 가능합니다"
+                            ));
+                        } else {
+                            ui.weak("선택된 엔티티 없음");
+                        }
                     }
                 }
             });
@@ -415,6 +530,7 @@ impl CadApp {
             }
 
             self.draw_selection_highlight(&painter, center);
+            self.draw_box_select(&painter, center, hover_world);
 
             if !matches!(self.tool, Tool::Select) {
                 draw_tool_preview(
@@ -471,15 +587,23 @@ impl CadApp {
         center: (f32, f32),
         tolerance_mm: f64,
     ) {
+        let additive = response.ctx.input(|i| i.modifiers.shift);
+
         if response.drag_started() {
             if let Some(pointer) = response.interact_pointer_pos() {
                 let world = self.camera.screen_to_world(center, (pointer.x, pointer.y));
-                self.selection = tool::hit_test(&self.project.drawing, world, tolerance_mm);
-                if let Some(id) = self.selection {
-                    self.draw_state = DrawState::Moving {
-                        entity_id: id,
-                        screen_delta: (0.0, 0.0),
-                    };
+                match tool::hit_test(&self.project.drawing, world, tolerance_mm) {
+                    // Pressing on an entity drags the whole selection it
+                    // belongs to, so a multi-selection moves together.
+                    Some(id) => {
+                        self.apply_pick(id, additive);
+                        self.draw_state = DrawState::Moving {
+                            entity_ids: self.selection.iter().copied().collect(),
+                            screen_delta: (0.0, 0.0),
+                        };
+                    }
+                    // Pressing on empty canvas starts a rubber-band box.
+                    None => self.draw_state = DrawState::BoxSelect { anchor: world },
                 }
             }
         }
@@ -493,27 +617,70 @@ impl CadApp {
         }
 
         if response.drag_stopped() {
-            if let DrawState::Moving {
-                entity_id,
-                screen_delta,
-            } = self.draw_state
-            {
-                self.draw_state = DrawState::Idle;
-                if screen_delta.0.abs() > f32::EPSILON || screen_delta.1.abs() > f32::EPSILON {
-                    let dx = f64::from(screen_delta.0 / self.camera.zoom);
-                    let dy = f64::from(-screen_delta.1 / self.camera.zoom);
-                    self.execute(DrawingCommand::MoveEntity {
-                        id: entity_id,
-                        dx: LengthMm(dx),
-                        dy: LengthMm(dy),
-                    });
+            match std::mem::take(&mut self.draw_state) {
+                DrawState::Moving {
+                    entity_ids,
+                    screen_delta,
+                } => {
+                    if screen_delta.0.abs() > f32::EPSILON || screen_delta.1.abs() > f32::EPSILON {
+                        let dx = f64::from(screen_delta.0 / self.camera.zoom);
+                        let dy = f64::from(-screen_delta.1 / self.camera.zoom);
+                        self.execute(DrawingCommand::MoveEntities {
+                            ids: entity_ids,
+                            dx: LengthMm(dx),
+                            dy: LengthMm(dy),
+                        });
+                    }
                 }
+                DrawState::BoxSelect { anchor } => {
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        let world = self.camera.screen_to_world(center, (pointer.x, pointer.y));
+                        let picked = tool::entities_in_box(&self.project.drawing, anchor, world);
+                        if !additive {
+                            self.selection.clear();
+                        }
+                        // Box-selecting part of a group selects all of it,
+                        // matching what clicking one member does.
+                        for id in picked {
+                            self.selection
+                                .extend(tool::expand_group(&self.project.drawing, id));
+                        }
+                    }
+                }
+                // Any other state was not a selection gesture; `take` above
+                // already reset it to `Idle`.
+                _ => {}
             }
         } else if response.clicked() {
             if let Some(pointer) = response.interact_pointer_pos() {
                 let world = self.camera.screen_to_world(center, (pointer.x, pointer.y));
-                self.selection = tool::hit_test(&self.project.drawing, world, tolerance_mm);
+                match tool::hit_test(&self.project.drawing, world, tolerance_mm) {
+                    Some(id) => self.apply_pick(id, additive),
+                    None if !additive => self.selection.clear(),
+                    None => {}
+                }
             }
+        }
+    }
+
+    /// Applies a single pick to the selection. A picked entity brings its
+    /// whole group along ([`tool::expand_group`]). Without `additive` the
+    /// pick replaces the selection; with it, an already-selected group is
+    /// removed and an unselected one is added (shift-click toggles).
+    fn apply_pick(&mut self, id: EntityId, additive: bool) {
+        let picked = tool::expand_group(&self.project.drawing, id);
+        if !additive {
+            // Re-picking inside the current selection keeps it intact, so
+            // dragging a multi-selection doesn't collapse it to one entity.
+            if !self.selection.is_superset(&picked) {
+                self.selection = picked;
+            }
+            return;
+        }
+        if self.selection.is_superset(&picked) {
+            self.selection.retain(|id| !picked.contains(id));
+        } else {
+            self.selection.extend(picked);
         }
     }
 
@@ -572,31 +739,59 @@ impl CadApp {
     }
 
     fn draw_selection_highlight(&self, painter: &egui::Painter, center: (f32, f32)) {
-        let Some(id) = self.selection else { return };
-        let Some(entity) = self
-            .project
-            .drawing
-            .entities
-            .iter()
-            .find(|entity| entity.id == id)
-        else {
+        if self.selection.is_empty() {
+            return;
+        }
+        let highlight_stroke = egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 200, 60));
+        // Entities being dragged are drawn at a pixel offset for live
+        // preview; the project itself is only changed when the drag ends.
+        let moving = match &self.draw_state {
+            DrawState::Moving {
+                entity_ids,
+                screen_delta,
+            } => Some((entity_ids, *screen_delta)),
+            _ => None,
+        };
+
+        for entity in &self.project.drawing.entities {
+            if !self.selection.contains(&entity.id) {
+                continue;
+            }
+            let offset = moving.map_or((0.0, 0.0), |(ids, delta)| {
+                if ids.contains(&entity.id) {
+                    delta
+                } else {
+                    (0.0, 0.0)
+                }
+            });
+            draw_geometry(
+                painter,
+                &self.camera,
+                center,
+                &entity.geometry,
+                offset,
+                highlight_stroke,
+            );
+        }
+    }
+
+    /// Draws the rubber-band rectangle while a box selection is in progress.
+    fn draw_box_select(
+        &self,
+        painter: &egui::Painter,
+        center: (f32, f32),
+        hover_world: Option<(f64, f64)>,
+    ) {
+        let DrawState::BoxSelect { anchor } = self.draw_state else {
             return;
         };
-        let offset = match self.draw_state {
-            DrawState::Moving {
-                entity_id,
-                screen_delta,
-            } if entity_id == id => screen_delta,
-            _ => (0.0, 0.0),
-        };
-        let highlight_stroke = egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 200, 60));
-        draw_geometry(
-            painter,
-            &self.camera,
-            center,
-            &entity.geometry,
-            offset,
-            highlight_stroke,
+        let Some(hover) = hover_world else { return };
+        let (ax, ay) = self.camera.world_to_screen(center, anchor);
+        let (bx, by) = self.camera.world_to_screen(center, hover);
+        painter.rect_stroke(
+            egui::Rect::from_two_pos(egui::pos2(ax, ay), egui::pos2(bx, by)),
+            0.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(140, 190, 255)),
         );
     }
 
@@ -886,5 +1081,104 @@ fn draw_primitive(
                 egui::Color32::WHITE,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cad_core::{Line, Point2};
+
+    /// A three-entity app with entities 1 and 2 in a group, entity 3 loose.
+    /// Built without any `egui` context — the selection helpers under test
+    /// only read `project.drawing` and write `selection`.
+    fn app_with_group() -> CadApp {
+        let mut app = CadApp::default();
+        let mut project = Project::default();
+        for (id, offset) in [(1u64, 10.0), (2, 20.0), (3, 30.0)] {
+            project
+                .drawing
+                .add_entity(Entity {
+                    id: EntityId::new(id),
+                    layer_id: DEFAULT_LAYER_ID,
+                    geometry: EntityGeometry::Line(Line {
+                        start: Point2::new(offset, 0.0),
+                        end: Point2::new(offset, 5.0),
+                    }),
+                })
+                .unwrap();
+        }
+        project
+            .drawing
+            .add_group(Group {
+                id: GroupId::new(1),
+                name: "그룹 1".to_owned(),
+                member_ids: vec![EntityId::new(1), EntityId::new(2)],
+            })
+            .unwrap();
+        app.project = project;
+        app
+    }
+
+    fn ids(values: &[u64]) -> HashSet<EntityId> {
+        values.iter().copied().map(EntityId::new).collect()
+    }
+
+    #[test]
+    fn plain_pick_replaces_the_selection() {
+        let mut app = app_with_group();
+        app.apply_pick(EntityId::new(3), false);
+        assert_eq!(app.selection, ids(&[3]));
+    }
+
+    #[test]
+    fn picking_a_grouped_entity_selects_the_whole_group() {
+        let mut app = app_with_group();
+        app.apply_pick(EntityId::new(1), false);
+        assert_eq!(app.selection, ids(&[1, 2]));
+    }
+
+    #[test]
+    fn plain_pick_inside_the_current_selection_keeps_it_intact() {
+        // Otherwise pressing on one member of a multi-selection to drag it
+        // would collapse the selection to that single entity.
+        let mut app = app_with_group();
+        app.selection = ids(&[1, 2, 3]);
+        app.apply_pick(EntityId::new(3), false);
+        assert_eq!(app.selection, ids(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn additive_pick_adds_then_removes_the_same_group() {
+        let mut app = app_with_group();
+        app.apply_pick(EntityId::new(3), true);
+        app.apply_pick(EntityId::new(2), true);
+        assert_eq!(app.selection, ids(&[1, 2, 3]));
+
+        // Shift-clicking the group again toggles all of its members off.
+        app.apply_pick(EntityId::new(1), true);
+        assert_eq!(app.selection, ids(&[3]));
+    }
+
+    #[test]
+    fn single_selection_is_none_unless_exactly_one_is_selected() {
+        let mut app = app_with_group();
+        assert_eq!(app.single_selection(), None);
+
+        app.selection = ids(&[3]);
+        assert_eq!(app.single_selection(), Some(EntityId::new(3)));
+
+        app.selection = ids(&[1, 2]);
+        assert_eq!(app.single_selection(), None);
+    }
+
+    #[test]
+    fn delete_selection_removes_every_selected_entity() {
+        let mut app = app_with_group();
+        app.selection = ids(&[1, 2]);
+        app.delete_selection();
+        assert!(app.selection.is_empty());
+        assert_eq!(app.project.drawing.entities.len(), 1);
+        assert_eq!(app.project.drawing.entities[0].id, EntityId::new(3));
     }
 }

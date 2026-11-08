@@ -3,6 +3,8 @@
 //! so this logic can be unit tested without a running GUI — the same
 //! separation `camera.rs` uses.
 
+use std::collections::HashSet;
+
 use cad_core::{
     AngleRad, Arc, Circle, Drawing, EntityGeometry, EntityId, LengthMm, Line, Point2, Rectangle,
     Text,
@@ -60,12 +62,18 @@ pub enum DrawState {
         origin: (f64, f64),
         content: String,
     },
-    /// Dragging the selected entity. `screen_delta` accumulates raw pixel
-    /// motion for live preview; it is converted to a world-space
-    /// `MoveEntity` only when the drag ends.
+    /// Dragging the current selection (one or many entities together).
+    /// `screen_delta` accumulates raw pixel motion for live preview; it is
+    /// converted to a world-space `MoveEntities` only when the drag ends.
     Moving {
-        entity_id: EntityId,
+        entity_ids: Vec<EntityId>,
         screen_delta: (f32, f32),
+    },
+    /// Dragging a selection box from `anchor` to the current pointer
+    /// position on empty canvas. Resolved into a selection set
+    /// (`entities_in_box`) when the drag ends.
+    BoxSelect {
+        anchor: (f64, f64),
     },
 }
 
@@ -213,10 +221,49 @@ pub fn snap_point(drawing: &Drawing, raw: (f64, f64), tolerance_mm: f64) -> (f64
         .map_or(raw, |p| (p.x.0, p.y.0))
 }
 
+fn normalize_box(a: (f64, f64), b: (f64, f64)) -> ((f64, f64), (f64, f64)) {
+    ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)))
+}
+
+/// Entities with at least one snap-candidate point (endpoint, midpoint,
+/// center, corner) inside the axis-aligned box spanned by `corner_a`/
+/// `corner_b` — corner order doesn't matter. Hidden-layer entities are
+/// excluded, matching what's actually visible and matching [`hit_test`].
+#[must_use]
+pub fn entities_in_box(
+    drawing: &Drawing,
+    corner_a: (f64, f64),
+    corner_b: (f64, f64),
+) -> HashSet<EntityId> {
+    let (min, max) = normalize_box(corner_a, corner_b);
+    drawing
+        .entities
+        .iter()
+        .filter(|entity| cad_render::is_layer_visible(drawing, entity.layer_id))
+        .filter(|entity| {
+            cad_geometry::snap_candidates(&entity.geometry)
+                .into_iter()
+                .any(|p| p.x.0 >= min.0 && p.x.0 <= max.0 && p.y.0 >= min.1 && p.y.0 <= max.1)
+        })
+        .map(|entity| entity.id)
+        .collect()
+}
+
+/// If `id` belongs to a group, returns every member of that group (so
+/// clicking one grouped entity selects the whole group); otherwise returns
+/// just `id` on its own.
+#[must_use]
+pub fn expand_group(drawing: &Drawing, id: EntityId) -> HashSet<EntityId> {
+    match drawing.group_containing(id) {
+        Some(group) => group.member_ids.iter().copied().collect(),
+        None => std::iter::once(id).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cad_core::{Entity, Layer, LayerId, Project, DEFAULT_LAYER_ID};
+    use cad_core::{Entity, Group, GroupId, Layer, LayerId, Project, DEFAULT_LAYER_ID};
 
     fn drawing_with_line(start: (f64, f64), end: (f64, f64)) -> Drawing {
         let mut project = Project::default();
@@ -347,6 +394,97 @@ mod tests {
     fn snap_point_returns_raw_point_when_nothing_in_range() {
         let drawing = drawing_with_line((0.0, 0.0), (10.0, 0.0));
         assert_eq!(snap_point(&drawing, (5.0, 5.0), 1.0), (5.0, 5.0));
+    }
+
+    #[test]
+    fn entities_in_box_finds_entities_with_a_point_inside() {
+        let mut project = Project::default();
+        project
+            .drawing
+            .add_entity(Entity {
+                id: EntityId::new(1),
+                layer_id: DEFAULT_LAYER_ID,
+                geometry: line_geometry((0.0, 0.0), (1.0, 0.0)),
+            })
+            .unwrap();
+        project
+            .drawing
+            .add_entity(Entity {
+                id: EntityId::new(2),
+                layer_id: DEFAULT_LAYER_ID,
+                geometry: line_geometry((100.0, 100.0), (101.0, 100.0)),
+            })
+            .unwrap();
+
+        let found = entities_in_box(&project.drawing, (-5.0, -5.0), (5.0, 5.0));
+        assert_eq!(found, [EntityId::new(1)].into_iter().collect());
+    }
+
+    #[test]
+    fn entities_in_box_ignores_corner_order() {
+        let drawing = drawing_with_line((0.0, 0.0), (1.0, 0.0));
+        // Dragged from bottom-right to top-left, same as Phase 8b's
+        // rectangle_geometry normalization test.
+        let found = entities_in_box(&drawing, (5.0, 5.0), (-5.0, -5.0));
+        assert_eq!(found, [EntityId::new(1)].into_iter().collect());
+    }
+
+    #[test]
+    fn entities_in_box_skips_hidden_layers() {
+        let mut project = Project::default();
+        let hidden = LayerId::new(1);
+        let mut layer = Layer::new(hidden, "hidden");
+        layer.visible = false;
+        project.drawing.add_layer(layer).unwrap();
+        project
+            .drawing
+            .add_entity(Entity {
+                id: EntityId::new(1),
+                layer_id: hidden,
+                geometry: line_geometry((0.0, 0.0), (1.0, 0.0)),
+            })
+            .unwrap();
+
+        let found = entities_in_box(&project.drawing, (-5.0, -5.0), (5.0, 5.0));
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn expand_group_returns_all_members_when_grouped() {
+        let mut project = Project::default();
+        project.drawing.add_entity(make_entity(1)).unwrap();
+        project.drawing.add_entity(make_entity(2)).unwrap();
+        project
+            .drawing
+            .add_group(Group {
+                id: GroupId::new(1),
+                name: "part-a".to_owned(),
+                member_ids: vec![EntityId::new(1), EntityId::new(2)],
+            })
+            .unwrap();
+
+        let expanded = expand_group(&project.drawing, EntityId::new(1));
+        assert_eq!(
+            expanded,
+            [EntityId::new(1), EntityId::new(2)].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn expand_group_returns_just_the_entity_when_ungrouped() {
+        let mut project = Project::default();
+        project.drawing.add_entity(make_entity(1)).unwrap();
+
+        let expanded = expand_group(&project.drawing, EntityId::new(1));
+        assert_eq!(expanded, [EntityId::new(1)].into_iter().collect());
+    }
+
+    fn make_entity(id: u64) -> Entity {
+        Entity {
+            id: EntityId::new(id),
+            layer_id: DEFAULT_LAYER_ID,
+            geometry: line_geometry((0.0, 0.0), (1.0, 0.0)),
+        }
     }
 
     #[test]

@@ -39,6 +39,7 @@ stable_id!(EntityId);
 stable_id!(LayerId);
 stable_id!(DimensionId);
 stable_id!(SheetId);
+stable_id!(GroupId);
 
 // ---------------------------------------------------------------------------
 // Units
@@ -193,6 +194,21 @@ pub struct Dimension {
 }
 
 // ---------------------------------------------------------------------------
+// Group
+// ---------------------------------------------------------------------------
+
+/// A named collection of entities that select and move together. Membership
+/// lives here (as a list of member IDs) rather than as a back-reference on
+/// `Entity`, so grouping doesn't touch the entity model at all — every
+/// existing `Entity` literal across the workspace keeps compiling unchanged.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    pub id: GroupId,
+    pub name: String,
+    pub member_ids: Vec<EntityId>,
+}
+
+// ---------------------------------------------------------------------------
 // Drawing and Project
 // ---------------------------------------------------------------------------
 
@@ -208,6 +224,9 @@ pub struct Drawing {
     pub entities: Vec<Entity>,
     pub layers: Vec<Layer>,
     pub dimensions: Vec<Dimension>,
+    /// Defaults to empty when loading a file saved before groups existed.
+    #[serde(default)]
+    pub groups: Vec<Group>,
 }
 
 impl Default for Drawing {
@@ -217,6 +236,7 @@ impl Default for Drawing {
             entities: Vec::new(),
             layers: vec![Layer::new(DEFAULT_LAYER_ID, "0")],
             dimensions: Vec::new(),
+            groups: Vec::new(),
         }
     }
 }
@@ -248,6 +268,8 @@ pub enum CoreError {
     MissingLayer(LayerId),
     DuplicateDimensionId(DimensionId),
     MissingDimension(DimensionId),
+    DuplicateGroupId(GroupId),
+    MissingGroup(GroupId),
 }
 
 impl fmt::Display for CoreError {
@@ -259,6 +281,8 @@ impl fmt::Display for CoreError {
             Self::MissingLayer(id) => write!(f, "missing layer id: {id}"),
             Self::DuplicateDimensionId(id) => write!(f, "duplicate dimension id: {id}"),
             Self::MissingDimension(id) => write!(f, "missing dimension id: {id}"),
+            Self::DuplicateGroupId(id) => write!(f, "duplicate group id: {id}"),
+            Self::MissingGroup(id) => write!(f, "missing group id: {id}"),
         }
     }
 }
@@ -285,6 +309,7 @@ pub enum ValidationTarget {
     Entity(EntityId),
     Layer(LayerId),
     Dimension(DimensionId),
+    Group(GroupId),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -401,9 +426,52 @@ impl Drawing {
         Ok(self.dimensions.remove(index))
     }
 
+    /// Adds a group while preserving stable-ID uniqueness.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DuplicateGroupId` when the group ID is already present.
+    pub fn add_group(&mut self, group: Group) -> Result<(), CoreError> {
+        if self.groups.iter().any(|g| g.id == group.id) {
+            return Err(CoreError::DuplicateGroupId(group.id));
+        }
+        self.groups.push(group);
+        Ok(())
+    }
+
+    /// Removes and returns a group by stable ID. Member entities themselves
+    /// are untouched — only the group record is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MissingGroup` when no group has the requested ID.
+    pub fn remove_group(&mut self, id: GroupId) -> Result<Group, CoreError> {
+        let index = self
+            .groups
+            .iter()
+            .position(|g| g.id == id)
+            .ok_or(CoreError::MissingGroup(id))?;
+        Ok(self.groups.remove(index))
+    }
+
+    /// Returns a shared reference to the group with the given ID.
+    #[must_use]
+    pub fn group(&self, id: GroupId) -> Option<&Group> {
+        self.groups.iter().find(|g| g.id == id)
+    }
+
+    /// The group (if any) that lists `entity_id` as a member.
+    #[must_use]
+    pub fn group_containing(&self, entity_id: EntityId) -> Option<&Group> {
+        self.groups
+            .iter()
+            .find(|g| g.member_ids.contains(&entity_id))
+    }
+
     /// Checks structural invariants that saving, exporting, or running a
     /// command must be able to rely on: every entity and dimension must
-    /// reference a layer that exists in this drawing.
+    /// reference a layer that exists in this drawing, and every group
+    /// member must reference an entity that exists in this drawing.
     #[must_use]
     pub fn validate(&self) -> ValidationReport {
         let mut issues = Vec::new();
@@ -431,6 +499,20 @@ impl Drawing {
                         "Create the missing layer or reassign the dimension to an existing layer."
                             .to_owned(),
                 });
+            }
+        }
+
+        for group in &self.groups {
+            for member_id in &group.member_ids {
+                if !self.entities.iter().any(|e| e.id == *member_id) {
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Error,
+                        target: ValidationTarget::Group(group.id),
+                        message: format!("group references missing entity {member_id}"),
+                        suggestion: "Remove the missing entity from the group or delete the group."
+                            .to_owned(),
+                    });
+                }
             }
         }
 
@@ -652,6 +734,92 @@ mod tests {
     }
 
     #[test]
+    fn drawing_default_has_no_groups() {
+        assert!(Drawing::default().groups.is_empty());
+    }
+
+    #[test]
+    fn add_and_remove_group() {
+        let mut drawing = Drawing::default();
+        drawing.add_entity(make_line_entity(1)).unwrap();
+        drawing.add_entity(make_line_entity(2)).unwrap();
+        let group = Group {
+            id: GroupId::new(1),
+            name: "part-a".to_owned(),
+            member_ids: vec![EntityId::new(1), EntityId::new(2)],
+        };
+
+        drawing.add_group(group.clone()).unwrap();
+        assert_eq!(drawing.group(GroupId::new(1)), Some(&group));
+
+        let removed = drawing.remove_group(GroupId::new(1)).unwrap();
+        assert_eq!(removed, group);
+        assert!(drawing.group(GroupId::new(1)).is_none());
+    }
+
+    #[test]
+    fn duplicate_group_id_is_rejected() {
+        let mut drawing = Drawing::default();
+        let group = Group {
+            id: GroupId::new(1),
+            name: "a".to_owned(),
+            member_ids: vec![],
+        };
+        drawing.add_group(group.clone()).unwrap();
+        assert_eq!(
+            drawing.add_group(group),
+            Err(CoreError::DuplicateGroupId(GroupId::new(1)))
+        );
+    }
+
+    #[test]
+    fn remove_group_reports_missing_group() {
+        let mut drawing = Drawing::default();
+        assert_eq!(
+            drawing.remove_group(GroupId::new(99)),
+            Err(CoreError::MissingGroup(GroupId::new(99)))
+        );
+    }
+
+    #[test]
+    fn group_containing_finds_the_owning_group() {
+        let mut drawing = Drawing::default();
+        drawing.add_entity(make_line_entity(1)).unwrap();
+        drawing
+            .add_group(Group {
+                id: GroupId::new(1),
+                name: "a".to_owned(),
+                member_ids: vec![EntityId::new(1)],
+            })
+            .unwrap();
+
+        assert_eq!(
+            drawing.group_containing(EntityId::new(1)).map(|g| g.id),
+            Some(GroupId::new(1))
+        );
+        assert!(drawing.group_containing(EntityId::new(99)).is_none());
+    }
+
+    #[test]
+    fn validate_detects_group_referencing_missing_entity() {
+        let mut drawing = Drawing::default();
+        drawing
+            .add_group(Group {
+                id: GroupId::new(1),
+                name: "a".to_owned(),
+                member_ids: vec![EntityId::new(404)],
+            })
+            .unwrap();
+
+        let report = drawing.validate();
+        assert!(report.has_errors());
+        assert_eq!(
+            report.issues[0].target,
+            ValidationTarget::Group(GroupId::new(1))
+        );
+    }
+
+    #[test]
     fn entity_geometry_serializes_with_a_type_tag() {
         let line = EntityGeometry::Line(Line {
             start: Point2::new(0.0, 0.0),
@@ -671,5 +839,13 @@ mod tests {
         let json = serde_json::to_string(&project).unwrap();
         let restored: Project = serde_json::from_str(&json).unwrap();
         assert_eq!(project, restored);
+    }
+
+    #[test]
+    fn drawing_deserializes_without_a_groups_field() {
+        // Simulates a file saved before groups existed: no "groups" key.
+        let json = r#"{"id":0,"entities":[],"layers":[{"id":0,"name":"0","visible":true,"locked":false}],"dimensions":[]}"#;
+        let drawing: Drawing = serde_json::from_str(json).unwrap();
+        assert!(drawing.groups.is_empty());
     }
 }

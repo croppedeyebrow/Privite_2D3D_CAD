@@ -2,8 +2,8 @@
 
 use cad_core::{
     Arc, Circle, CoreError, Dimension, DimensionId, Drawing, Entity, EntityGeometry, EntityId,
-    Layer, LayerId, LengthMm, Line, Point2, Polyline, Project, Rectangle, Text, ValidationIssue,
-    ValidationReport, ValidationSeverity, ValidationTarget,
+    Group, GroupId, Layer, LayerId, LengthMm, Line, Point2, Polyline, Project, Rectangle, Text,
+    ValidationIssue, ValidationReport, ValidationSeverity, ValidationTarget,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -14,6 +14,13 @@ pub enum DrawingCommand {
     },
     MoveEntity {
         id: EntityId,
+        dx: LengthMm,
+        dy: LengthMm,
+    },
+    /// Moves several entities by the same delta as one undo step — used
+    /// when dragging a multi-selection (box select) on the canvas.
+    MoveEntities {
+        ids: Vec<EntityId>,
         dx: LengthMm,
         dy: LengthMm,
     },
@@ -41,6 +48,13 @@ pub enum DrawingCommand {
     AddDimension(Dimension),
     RemoveDimension {
         id: DimensionId,
+    },
+    /// Creates a group record from an already-built `Group` (id, name, and
+    /// member entity IDs). The UI is responsible for only offering this on
+    /// entities that aren't already grouped — see `tool.rs` in `cad_app`.
+    GroupEntities(Group),
+    UngroupEntities {
+        group_id: GroupId,
     },
 }
 
@@ -226,11 +240,25 @@ fn apply(project: &mut Project, command: &DrawingCommand) -> Result<(), CommandE
     match command {
         DrawingCommand::AddEntity(entity) => drawing(project).add_entity(entity.clone())?,
         DrawingCommand::DeleteEntity { id } => {
-            drawing(project).remove_entity(*id)?;
+            let d = drawing(project);
+            // Drop the entity from any group first, so it doesn't leave a
+            // dangling member reference the post-apply validation would
+            // reject. This is a one-way cleanup: undoing a delete restores
+            // the entity but not its group membership.
+            for group in &mut d.groups {
+                group.member_ids.retain(|member_id| *member_id != *id);
+            }
+            d.remove_entity(*id)?;
         }
         DrawingCommand::MoveEntity { id, dx, dy } => {
             let entity = find_entity_mut(drawing(project), *id)?;
             entity.geometry = translate_geometry(&entity.geometry, *dx, *dy);
+        }
+        DrawingCommand::MoveEntities { ids, dx, dy } => {
+            for id in ids {
+                let entity = find_entity_mut(drawing(project), *id)?;
+                entity.geometry = translate_geometry(&entity.geometry, *dx, *dy);
+            }
         }
         DrawingCommand::SetEntityLayer { id, layer_id } => {
             find_entity_mut(drawing(project), *id)?.layer_id = *layer_id;
@@ -251,6 +279,10 @@ fn apply(project: &mut Project, command: &DrawingCommand) -> Result<(), CommandE
         DrawingCommand::AddDimension(dim) => drawing(project).add_dimension(dim.clone())?,
         DrawingCommand::RemoveDimension { id } => {
             drawing(project).remove_dimension(*id)?;
+        }
+        DrawingCommand::GroupEntities(group) => drawing(project).add_group(group.clone())?,
+        DrawingCommand::UngroupEntities { group_id } => {
+            drawing(project).remove_group(*group_id)?;
         }
     }
     Ok(())
@@ -273,6 +305,11 @@ fn inverse(
         ),
         DrawingCommand::MoveEntity { id, dx, dy } => DrawingCommand::MoveEntity {
             id: *id,
+            dx: LengthMm(-dx.0),
+            dy: LengthMm(-dy.0),
+        },
+        DrawingCommand::MoveEntities { ids, dx, dy } => DrawingCommand::MoveEntities {
+            ids: ids.clone(),
             dx: LengthMm(-dx.0),
             dy: LengthMm(-dy.0),
         },
@@ -342,6 +379,16 @@ fn inverse(
                 .find(|dim| dim.id == *id)
                 .cloned()
                 .ok_or(CoreError::MissingDimension(*id))?,
+        ),
+        DrawingCommand::GroupEntities(group) => {
+            DrawingCommand::UngroupEntities { group_id: group.id }
+        }
+        DrawingCommand::UngroupEntities { group_id } => DrawingCommand::GroupEntities(
+            project
+                .drawing
+                .group(*group_id)
+                .cloned()
+                .ok_or(CoreError::MissingGroup(*group_id))?,
         ),
     })
 }
@@ -596,6 +643,154 @@ mod tests {
 
         assert!(history.undo(&mut project).unwrap());
         assert!(project.drawing.layer(DEFAULT_LAYER_ID).unwrap().visible);
+    }
+
+    #[test]
+    fn move_entities_translates_all_members_as_one_undo_step() {
+        let mut project = Project::default();
+        let mut history = CommandHistory::default();
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::AddEntity(line_entity(1, (0.0, 0.0), (10.0, 0.0))),
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::AddEntity(line_entity(2, (0.0, 5.0), (10.0, 5.0))),
+            )
+            .unwrap();
+
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::MoveEntities {
+                    ids: vec![EntityId::new(1), EntityId::new(2)],
+                    dx: LengthMm(3.0),
+                    dy: LengthMm(1.0),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            project.drawing.entities[0].geometry,
+            EntityGeometry::Line(Line {
+                start: Point2::new(3.0, 1.0),
+                end: Point2::new(13.0, 1.0),
+            })
+        );
+        assert_eq!(
+            project.drawing.entities[1].geometry,
+            EntityGeometry::Line(Line {
+                start: Point2::new(3.0, 6.0),
+                end: Point2::new(13.0, 6.0),
+            })
+        );
+
+        // One undo restores both entities, not just one.
+        assert!(history.undo(&mut project).unwrap());
+        assert_eq!(
+            project.drawing.entities[0].geometry,
+            EntityGeometry::Line(Line {
+                start: Point2::new(0.0, 0.0),
+                end: Point2::new(10.0, 0.0),
+            })
+        );
+        assert_eq!(
+            project.drawing.entities[1].geometry,
+            EntityGeometry::Line(Line {
+                start: Point2::new(0.0, 5.0),
+                end: Point2::new(10.0, 5.0),
+            })
+        );
+    }
+
+    #[test]
+    fn group_and_ungroup_entities_can_be_undone_and_redone() {
+        let mut project = Project::default();
+        let mut history = CommandHistory::default();
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::AddEntity(line_entity(1, (0.0, 0.0), (1.0, 0.0))),
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::AddEntity(line_entity(2, (0.0, 1.0), (1.0, 1.0))),
+            )
+            .unwrap();
+
+        let group = Group {
+            id: GroupId::new(1),
+            name: "part-a".to_owned(),
+            member_ids: vec![EntityId::new(1), EntityId::new(2)],
+        };
+        history
+            .execute(&mut project, DrawingCommand::GroupEntities(group.clone()))
+            .unwrap();
+        assert_eq!(project.drawing.group(GroupId::new(1)), Some(&group));
+
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::UngroupEntities {
+                    group_id: GroupId::new(1),
+                },
+            )
+            .unwrap();
+        assert!(project.drawing.group(GroupId::new(1)).is_none());
+
+        // Undoing the ungroup recreates the exact same group.
+        assert!(history.undo(&mut project).unwrap());
+        assert_eq!(project.drawing.group(GroupId::new(1)), Some(&group));
+
+        // Undoing the group creation removes it again.
+        assert!(history.undo(&mut project).unwrap());
+        assert!(project.drawing.group(GroupId::new(1)).is_none());
+    }
+
+    #[test]
+    fn deleting_a_grouped_entity_removes_it_from_the_group() {
+        let mut project = Project::default();
+        let mut history = CommandHistory::default();
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::AddEntity(line_entity(1, (0.0, 0.0), (1.0, 0.0))),
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::AddEntity(line_entity(2, (0.0, 1.0), (1.0, 1.0))),
+            )
+            .unwrap();
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::GroupEntities(Group {
+                    id: GroupId::new(1),
+                    name: "part-a".to_owned(),
+                    member_ids: vec![EntityId::new(1), EntityId::new(2)],
+                }),
+            )
+            .unwrap();
+
+        history
+            .execute(
+                &mut project,
+                DrawingCommand::DeleteEntity {
+                    id: EntityId::new(1),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            project.drawing.group(GroupId::new(1)).unwrap().member_ids,
+            vec![EntityId::new(2)]
+        );
     }
 
     #[test]
